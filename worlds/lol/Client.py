@@ -71,6 +71,8 @@ class LOLContext(SuperContext):
         self.required_lp: int = 0
         self.win_completes_champion: bool = False
         self.slot_data: dict = {}
+        self._received_items_cache: set = set()  # (item, location, player) already written to disk
+        self._last_locations_sent: set = set()  # last set sent in LocationChecks
         # self.game_communication_path: files go in this path to pass data between us and the actual game
         if "localappdata" in os.environ:
             self.game_communication_path = os.path.expandvars(r"%localappdata%/LOLAP")
@@ -115,10 +117,17 @@ class LOLContext(SuperContext):
         if cmd in {"Connected"}:
             if not os.path.exists(self.game_communication_path):
                 os.makedirs(self.game_communication_path)
-            for ss in self.checked_locations:
-                filename = f"send{ss}"
-                with open(os.path.join(self.game_communication_path, filename), 'w') as f:
-                    f.close()
+            # Offload bulk file creation to a thread so the event loop stays responsive
+            checked = list(self.checked_locations)
+            comm_path = self.game_communication_path
+            def _write_send_files():
+                for ss in checked:
+                    filename = f"send{ss}"
+                    filepath = os.path.join(comm_path, filename)
+                    if not os.path.exists(filepath):
+                        with open(filepath, 'w') as f:
+                            pass
+            asyncio.get_event_loop().run_in_executor(None, _write_send_files)
             #Handle Slot Data
             for slot_data_key in list(args['slot_data'].keys()):
                 with open(os.path.join(self.game_communication_path, slot_data_key.replace(" ", "_") + ".cfg"), 'w') as f:
@@ -146,29 +155,39 @@ class LOLContext(SuperContext):
         if cmd in {"ReceivedItems"}:
             start_index = args["index"]
             if start_index != len(self.items_received):
+                # Seed the in-memory cache from disk on first use (e.g. after reconnect)
+                if not self._received_items_cache:
+                    try:
+                        for filename in os.listdir(self.game_communication_path):
+                            if filename.startswith("AP") and filename.endswith(".item"):
+                                with open(os.path.join(self.game_communication_path, filename), 'r') as f:
+                                    lines = f.read().splitlines()
+                                if len(lines) >= 3:
+                                    self._received_items_cache.add((lines[0], lines[1], lines[2]))
+                    except Exception:
+                        pass
+                # Find next file index once
+                check_num = 0
+                try:
+                    for filename in os.listdir(self.game_communication_path):
+                        if filename.startswith("AP") and filename.endswith(".item"):
+                            try:
+                                n = int(filename.split("_")[-1].split(".")[0])
+                                if n > check_num:
+                                    check_num = n
+                            except ValueError:
+                                pass
+                except Exception:
+                    pass
                 for item in args['items']:
-                    check_num = 0
-                    for filename in os.listdir(self.game_communication_path):
-                        if filename.startswith("AP"):
-                            if int(filename.split("_")[-1].split(".")[0]) > check_num:
-                                check_num = int(filename.split("_")[-1].split(".")[0])
-                    item_id = ""
-                    location_id = ""
-                    player = ""
-                    found = False
-                    for filename in os.listdir(self.game_communication_path):
-                        if filename.startswith(f"AP"):
-                            with open(os.path.join(self.game_communication_path, filename), 'r') as f:
-                                item_id = str(f.readline()).replace("\n", "")
-                                location_id = str(f.readline()).replace("\n", "")
-                                player = str(f.readline()).replace("\n", "")
-                                if str(item_id) == str(NetworkItem(*item).item) and str(location_id) == str(NetworkItem(*item).location) and str(player) == str(NetworkItem(*item).player) and int(location_id) > 0:
-                                    found = True
-                    if not found:
-                        filename = f"AP_{str(check_num+1)}.item"
+                    net_item = NetworkItem(*item)
+                    key = (str(net_item.item), str(net_item.location), str(net_item.player))
+                    if key not in self._received_items_cache and int(net_item.location) > 0:
+                        check_num += 1
+                        filename = f"AP_{check_num}.item"
                         with open(os.path.join(self.game_communication_path, filename), 'w') as f:
-                            f.write(str(NetworkItem(*item).item) + "\n" + str(NetworkItem(*item).location) + "\n" + str(NetworkItem(*item).player))
-                            f.close()
+                            f.write(f"{net_item.item}\n{net_item.location}\n{net_item.player}")
+                        self._received_items_cache.add(key)
 
         if cmd in {"RoomUpdate"}:
             if "checked_locations" in args:
@@ -254,18 +273,20 @@ async def game_watcher(ctx: LOLContext):
                             new_sends.append(sibling_id)
             sending.extend(new_sends)
 
+        sending_set = set(sending)
         ctx.locations_checked = sending
         if ctx.ui:
             await ctx.draw_lp_counter()
-        # persist checked locations for external tools
-        try:
-            with open(os.path.join(ctx.game_communication_path, "Checked_Locations.cfg"), 'w') as f:
-                f.write(str(list(ctx.locations_checked)))
-                f.close()
-        except Exception:
-            pass
-        message = [{"cmd": 'LocationChecks', "locations": sending}]
-        await ctx.send_msgs(message)
+        # Only write cfg and send LocationChecks when the set has actually changed
+        if sending_set != ctx._last_locations_sent:
+            ctx._last_locations_sent = sending_set
+            try:
+                with open(os.path.join(ctx.game_communication_path, "Checked_Locations.cfg"), 'w') as f:
+                    f.write(str(list(ctx.locations_checked)))
+            except Exception:
+                pass
+            message = [{"cmd": 'LocationChecks', "locations": sending}]
+            await ctx.send_msgs(message)
         if not ctx.finished_game and victory:
             await ctx.send_msgs([{"cmd": "StatusUpdate", "status": ClientStatus.CLIENT_GOAL}])
             ctx.finished_game = True
