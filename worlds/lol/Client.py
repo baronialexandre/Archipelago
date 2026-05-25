@@ -85,6 +85,37 @@ class LOLContext(SuperContext):
                 if file.find("obtain") <= -1:
                     os.remove(root+"/"+file)
 
+    def _clear_victory_marker(self):
+        try:
+            os.remove(os.path.join(self.game_communication_path, "victory"))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+    def _write_hinted_locations(self):
+        key = f"_read_hints_{self.team}_{self.slot}"
+        hinted_locations = set()
+        for hint in self.stored_data.get(key, []):
+            if isinstance(hint, dict):
+                if hint.get("found", False):
+                    continue
+                location = hint.get("location")
+            else:
+                location = getattr(hint, "location", None)
+                if getattr(hint, "found", False):
+                    continue
+            try:
+                if location is not None:
+                    hinted_locations.add(int(location))
+            except (TypeError, ValueError):
+                pass
+        try:
+            with open(os.path.join(self.game_communication_path, "Hinted_Locations.cfg"), 'w') as f:
+                f.write(str(sorted(hinted_locations)))
+        except Exception:
+            pass
+
     async def server_auth(self, password_requested: bool = False):
         if password_requested and not self.password:
             await super(LOLContext, self).server_auth(password_requested)
@@ -113,7 +144,17 @@ class LOLContext(SuperContext):
                     os.remove(root+"/"+file)
 
     def on_package(self, cmd: str, args: dict):
+        slot_changed = False
+        if cmd == "Connected":
+            previous_identity = (self.team, self.slot)
+            new_identity = (args.get("team"), args.get("slot"))
+            slot_changed = previous_identity != new_identity and previous_identity != (None, None)
+            if slot_changed:
+                self.finished_game = False
+                self._clear_victory_marker()
         super().on_package(cmd, args)
+        if cmd in {"Connected", "Retrieved", "SetReply"}:
+            self._write_hinted_locations()
         if cmd in {"Connected"}:
             if not os.path.exists(self.game_communication_path):
                 os.makedirs(self.game_communication_path)

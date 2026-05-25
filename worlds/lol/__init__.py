@@ -111,7 +111,15 @@ class LOLWorld(World):
 
     def set_rules(self):
         self.choose_possible_champions()
-        set_rules(self.multiworld, self.player, self.options, int(self.added_lp * (self.options.required_lp / 100)), self.possible_champions)
+        required_lp = self._compute_required_lp()
+        set_rules(self.multiworld, self.player, self.options, required_lp, self.possible_champions)
+
+    def _compute_required_lp(self) -> int:
+        pct = float(self.options.required_lp) / 100.0
+        raw = self.added_lp * pct
+        if raw < 1:
+            return 1
+        return int(raw)
 
     def create_regions(self):
         self.choose_possible_champions()
@@ -127,7 +135,7 @@ class LOLWorld(World):
                     ,"Configured Total LP": int(self.options.total_lp_count)
                     ,"Total LP":         int(self.added_lp)
                     ,"Required LP Percentage": int(self.options.required_lp)
-                    ,"Required LP":      int(self.added_lp * (self.options.required_lp / 100))
+                    ,"Required LP":      int(self._compute_required_lp())
                     ,"Starting Champion Count": int(self.options.starting_champions)
                     ,"Champion Subset Count": int(self.options.champion_subset_count)
                     ,"Win Completes Champion": int(self.options.win_completes_champion)

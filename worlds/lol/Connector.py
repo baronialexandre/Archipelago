@@ -54,6 +54,28 @@ if not os.path.exists(game_communication_path):
     os.makedirs(game_communication_path)
 
 
+def _read_auto_select_teammates() -> bool:
+    path = os.path.join(game_communication_path, "Auto_Select_Teammates.cfg")
+    try:
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                return bool(int(f.read().strip() or "0"))
+    except Exception:
+        pass
+    return False
+
+
+def _write_auto_select_teammates(enabled: bool) -> None:
+    try:
+        with open(os.path.join(game_communication_path, "Auto_Select_Teammates.cfg"), 'w') as f:
+            f.write("1" if enabled else "0")
+    except Exception:
+        pass
+
+
+auto_select_teammates = _read_auto_select_teammates()
+
+
 ###DEFINE FUNCTIONS###
 def get_game_data():
     """Returns (status, data) where status is one of:
@@ -138,13 +160,24 @@ def _champion_row_color(champion_id, window):
         return "#5C0000"  # dark red — locked
     active_location_ids  = window.metadata.get("active_location_ids")  if hasattr(window, "metadata") else None
     checked_location_ids = window.metadata.get("checked_location_ids") if hasattr(window, "metadata") else None
+    hinted_location_ids = window.metadata.get("hinted_location_ids") if hasattr(window, "metadata") else None
     if active_location_ids is None or checked_location_ids is None:
         return "#1A5C1A"  # green — unlocked, can't count yet
     champ_name = champions[champion_id]["name"]
     prefix = champ_name + " - "
     checked_ids = {int(x) for x in checked_location_ids}
+    hinted_ids = {int(x) for x in hinted_location_ids} if hinted_location_ids is not None else set()
+    unfound_hinted_ids = hinted_ids - checked_ids
     total = sum(1 for n in active_location_ids if n.startswith(prefix))
     done  = sum(1 for n, lid in active_location_ids.items() if n.startswith(prefix) and lid is not None and int(lid) in checked_ids)
+    hinted = any(
+        n.startswith(prefix)
+        and lid is not None
+        and int(lid) in unfound_hinted_ids
+        for n, lid in active_location_ids.items()
+    )
+    if hinted:
+        return "#277997"  # cyan — has a hinted open check
     remaining = max(0, total - done)
     return "#1A5C1A" if remaining > 0 else "#3A3A3A"  # green / grey
 
@@ -176,6 +209,16 @@ def display_champion_list(window):
                 checked_location_ids = set(ast.literal_eval(f.read()))
     except Exception:
         checked_location_ids = None
+
+    try:
+        path = os.path.join(game_communication_path, "Hinted_Locations.cfg")
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                hinted_location_ids = set(ast.literal_eval(f.read()))
+        else:
+            hinted_location_ids = None
+    except Exception:
+        hinted_location_ids = None
 
     # Build totals per champion from active_locations (names)
     totals = {}
@@ -246,6 +289,7 @@ def display_champion_list(window):
     # Cache for remaining-checks panel
     window.metadata["active_location_ids"] = active_location_ids
     window.metadata["checked_location_ids"] = checked_location_ids
+    window.metadata["hinted_location_ids"] = hinted_location_ids
 
     # Auto-select first champion if none selected yet
     if window.metadata.get("selected_champion_id") is None and champion_table_rows:
@@ -313,12 +357,19 @@ def won_game(game_data):
             return True
     return False
 
+def _player_name_from_record(player_data):
+    # Depending on game state/patch, Live Client Data may expose either key.
+    return player_data.get("riotIdGameName") or player_data.get("summonerName")
+
 def get_player_name(game_data):
-    return game_data["activePlayer"]["riotIdGameName"]
+    active_player = game_data.get("activePlayer", {})
+    return _player_name_from_record(active_player)
 
 def get_champion_name(game_data, player_name):
+    if not player_name:
+        return None
     for player in game_data["allPlayers"]:
-        if player["riotIdGameName"] == player_name:
+        if _player_name_from_record(player) == player_name:
             return player["championName"]
 
 def get_champion_id(champion_name):
@@ -328,30 +379,44 @@ def get_champion_id(champion_name):
 
 def get_available_teammates(game_data):
     player_name = get_player_name(game_data)
+    if not player_name:
+        return []
     player_team = None
     for player in game_data["allPlayers"]:
-        if player["riotIdGameName"] == player_name:
+        if _player_name_from_record(player) == player_name:
             player_team = player.get("team")
             break
     if player_team is None:
         return []
     teammate_names = []
     for player in game_data["allPlayers"]:
-        if player.get("team") == player_team and player["riotIdGameName"] != player_name:
-            teammate_names.append(player["riotIdGameName"])
+        name = _player_name_from_record(player)
+        if player.get("team") == player_team and name and name != player_name:
+            teammate_names.append(name)
     return sorted(teammate_names)
 
 def update_teammate_selector(window, teammate_names, game_data=None):
     display = []
+    auto_track = window["Auto Select Teammates"].get() if "Auto Select Teammates" in window.AllKeysDict else auto_select_teammates
     for name in teammate_names:
-        tracking = "✓ " if name in tracked_teammates else "  "
+        tracking = "✓ " if auto_track or name in tracked_teammates else "  "
         display.append(tracking + name)
     window["Tracked Teammates List"].update(values=display)
 
 def get_tracked_players(game_data):
     player_name = get_player_name(game_data)
+    if not player_name:
+        return []
     teammate_names = set(get_available_teammates(game_data))
-    selected_teammates = sorted(tracked_teammates.intersection(teammate_names))
+    # Always use the current checkbox value, not the global
+    try:
+        auto_track = window["Auto Select Teammates"].get()
+    except Exception:
+        auto_track = False
+    if auto_track:
+        selected_teammates = sorted(teammate_names)
+    else:
+        selected_teammates = sorted(tracked_teammates.intersection(teammate_names))
     return [player_name] + selected_teammates
 
 def assisted_tower(game_data, player_name):
@@ -374,25 +439,25 @@ def assisted_epic_monster(game_data, player_name, monster_name):
 
 def player_vision_score(game_data, player_name):
     for player in game_data["allPlayers"]:
-        if player["riotIdGameName"] == player_name:
+        if _player_name_from_record(player) == player_name:
             return player["scores"]["wardScore"]
     return 0
 
 def player_creep_score(game_data, player_name):
     for player in game_data["allPlayers"]:
-        if player["riotIdGameName"] == player_name:
+        if _player_name_from_record(player) == player_name:
             return player["scores"]["creepScore"]
     return 0
 
 def player_kills(game_data, player_name):
     for player in game_data["allPlayers"]:
-        if player["riotIdGameName"] == player_name:
+        if _player_name_from_record(player) == player_name:
             return player["scores"]["kills"]
     return 0
 
 def player_assists(game_data, player_name):
     for player in game_data["allPlayers"]:
-        if player["riotIdGameName"] == player_name:
+        if _player_name_from_record(player) == player_name:
             return player["scores"]["assists"]
     return 0
 
@@ -585,7 +650,8 @@ layout = [  [
                         size=(22, 5),
                         enable_events=True,
                         key="Tracked Teammates List",
-                        no_scrollbar=True)]
+                        no_scrollbar=True)],
+                    [sg.Checkbox("Auto Select All", key="Auto Select Teammates", default=auto_select_teammates)]
                ])
             ]
         ]
@@ -610,6 +676,10 @@ while True:
             window["Check for Match Button"].update(text="Match Tracking: Off", button_color=("white", "#5C0000"))
     if event == "Hide Completed Checkbox":
         display_champion_list(window)
+    if event == "Auto Select Teammates":
+        auto_select_teammates = window["Auto Select Teammates"].get()
+        if game_data is not None:
+            update_teammate_selector(window, get_available_teammates(game_data), game_data)
     if isinstance(event, tuple) and len(event) == 3 and event[0] == "Champions Unlocked Table" and event[1] == "+CLICKED+":
         cell = event[2]
         # cell may be an int or a (row, col) tuple depending on PySimpleGUI version/events
@@ -647,14 +717,15 @@ while True:
             if table_data and 0 <= row_index < len(table_data):
                 window.metadata["selected_champion_id"] = get_champion_id(table_data[row_index][0])
     if event == "Tracked Teammates List":
-        selected = values.get("Tracked Teammates List", [])
-        if selected:
-            raw = selected[0]
-            name = raw[2:] if raw.startswith(("\u2713 ", "  ")) else raw
-            if name in tracked_teammates:
-                tracked_teammates.discard(name)
-            else:
-                tracked_teammates.add(name)
+        if not auto_select_teammates:
+            selected = values.get("Tracked Teammates List", [])
+            if selected:
+                raw = selected[0]
+                name = raw[2:] if raw.startswith(("\u2713 ", "  ")) else raw
+                if name in tracked_teammates:
+                    tracked_teammates.discard(name)
+                else:
+                    tracked_teammates.add(name)
     get_items(game_values)
     read_cfg(game_values)
     display_champion_list(window)
