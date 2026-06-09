@@ -73,6 +73,7 @@ class LOLContext(SuperContext):
         self.slot_data: dict = {}
         self._received_items_cache: set = set()  # (item, location, player) already written to disk
         self._last_locations_sent: set = set()  # last set sent in LocationChecks
+        self._last_active_location_ids_written: set = set()
         # self.game_communication_path: files go in this path to pass data between us and the actual game
         if "localappdata" in os.environ:
             self.game_communication_path = os.path.expandvars(r"%localappdata%/LOLAP")
@@ -286,12 +287,55 @@ async def game_watcher(ctx: LOLContext):
         victory = False
         for root, dirs, files in os.walk(ctx.game_communication_path):
             for file in files:
-                if file.find("send") > -1:
-                    st = file.split("send", -1)[1]
-                    if st != "nil":
-                        sending = sending+[(int(st))]
+                if file.startswith("send"):
+                    st = file[4:]
+                    if st == "nil":
+                        continue
+                    if st.isdigit():
+                        sending.append(int(st))
                 if file.find("victory") > -1:
                     victory = True
+
+        # Guard against stale/foreign send files from previous sessions or slots.
+        # Only location IDs that belong to this slot's active location universe are valid.
+        active_ids = ctx.missing_locations | ctx.checked_locations
+        if active_ids != ctx._last_active_location_ids_written:
+            ctx._last_active_location_ids_written = set(active_ids)
+            active_location_ids = {
+                lookup_id_to_name[loc_id]: loc_id
+                for loc_id in sorted(active_ids)
+                if loc_id in lookup_id_to_name
+            }
+            active_locations = list(active_location_ids.keys())
+            try:
+                with open(os.path.join(ctx.game_communication_path, "Active_Location_IDs.cfg"), 'w') as f:
+                    f.write(str(active_location_ids))
+            except Exception:
+                pass
+            try:
+                with open(os.path.join(ctx.game_communication_path, "Active_Locations.cfg"), 'w') as f:
+                    f.write(str(active_locations))
+            except Exception:
+                pass
+
+        sending_set_pre_filter = set(sending)
+        if active_ids:
+            sending = [loc_id for loc_id in sending if loc_id in active_ids]
+        else:
+            # No active location universe yet: drop all queued send files as stale.
+            sending = []
+        stale_ids = sending_set_pre_filter - set(sending)
+        for stale_id in stale_ids:
+            stale_path = os.path.join(ctx.game_communication_path, f"send{stale_id}")
+            try:
+                os.remove(stale_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+        # Deduplicate while preserving deterministic ordering for cfg/messages.
+        sending = sorted(set(sending))
         # Win Completes Champion: auto-send all sibling locations when nexus is destroyed
         if ctx.win_completes_champion:
             all_active = ctx.missing_locations | ctx.checked_locations

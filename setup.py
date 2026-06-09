@@ -382,7 +382,7 @@ class BuildExeCommand(cx_Freeze.command.build_exe.BuildEXE):
                 with zipfile.ZipFile(self.libfolder / "worlds" / (file_name + ".apworld"), "x", zipfile.ZIP_DEFLATED,
                                      compresslevel=9) as zf:
                     for path in world_directory.rglob("*.*"):
-                        relative_path = os.path.join(*path.parts[path.parts.index("worlds")+1:])
+                        relative_path = "/".join(path.parts[path.parts.index("worlds") + 1:])
                         zf.write(path, relative_path)
                     folders_to_remove.append(file_name)
                 shutil.rmtree(world_directory)

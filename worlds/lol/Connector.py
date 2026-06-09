@@ -4,6 +4,7 @@ import requests
 import os
 import ast
 import sys
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 
 ###GET VERSION###
@@ -361,37 +362,132 @@ def _player_name_from_record(player_data):
     # Depending on game state/patch, Live Client Data may expose either key.
     return player_data.get("riotIdGameName") or player_data.get("summonerName")
 
+
+def _name_candidates_from_record(player_data):
+    candidates = set()
+    if not isinstance(player_data, dict):
+        return candidates
+    for key in ("riotIdGameName", "summonerName"):
+        value = player_data.get(key)
+        if not value:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        candidates.add(text.casefold())
+        if "#" in text:
+            candidates.add(text.split("#", 1)[0].casefold())
+    return candidates
+
+
+def _name_candidates_from_text(name_text):
+    candidates = set()
+    if not name_text:
+        return candidates
+    text = str(name_text).strip()
+    if not text:
+        return candidates
+    candidates.add(text.casefold())
+    if "#" in text:
+        candidates.add(text.split("#", 1)[0].casefold())
+    return candidates
+
+
+def _find_player_record(game_data, player_name):
+    target_candidates = _name_candidates_from_text(player_name)
+    if not target_candidates:
+        return None
+    for player in game_data.get("allPlayers", []):
+        if target_candidates.intersection(_name_candidates_from_record(player)):
+            return player
+    active_player = game_data.get("activePlayer", {})
+    if target_candidates.intersection(_name_candidates_from_record(active_player)):
+        return active_player
+    return None
+
 def get_player_name(game_data):
     active_player = game_data.get("activePlayer", {})
     return _player_name_from_record(active_player)
 
+def _champion_name_from_raw(raw_champion_name):
+    """Map raw champion key (if present) to the Data Dragon display name."""
+    if not raw_champion_name:
+        return None
+    token = str(raw_champion_name).split("_")[-1]
+    for champion_id in champions:
+        dd_id = champions[champion_id].get("id")
+        if dd_id and str(dd_id).casefold() == token.casefold():
+            return champions[champion_id]["name"]
+    return None
+
+def _normalize_champion_text(text: str) -> str:
+    """Accent/format-insensitive champion name normalization."""
+    normalized = unicodedata.normalize("NFKD", text)
+    stripped = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return "".join(ch for ch in stripped.casefold() if ch.isalnum())
+
 def get_champion_name(game_data, player_name):
     if not player_name:
         return None
+    active_candidates = _name_candidates_from_record(game_data.get("activePlayer", {}))
+    if player_name:
+        active_candidates.add(str(player_name).casefold())
     for player in game_data["allPlayers"]:
-        if _player_name_from_record(player) == player_name:
-            return player["championName"]
+        player_candidates = _name_candidates_from_record(player)
+        if active_candidates.intersection(player_candidates):
+            from_raw = _champion_name_from_raw(player.get("rawChampionName"))
+            if from_raw:
+                return from_raw
+            return player.get("championName")
+    active_player = game_data.get("activePlayer", {})
+    from_raw = _champion_name_from_raw(active_player.get("rawChampionName"))
+    if from_raw:
+        return from_raw
+    return active_player.get("championName")
 
 def get_champion_id(champion_name):
+    if not champion_name:
+        return None
     for champion_id in champions:
         if champions[champion_id]["name"] == champion_name:
             return champion_id
+    wanted = _normalize_champion_text(champion_name)
+    for champion_id in champions:
+        data = champions[champion_id]
+        if _normalize_champion_text(data["name"]) == wanted:
+            return champion_id
+        dd_id = data.get("id")
+        if dd_id and _normalize_champion_text(str(dd_id)) == wanted:
+            return champion_id
+
+
+def get_active_player_champion_id(game_data):
+    active_player = game_data.get("activePlayer", {})
+    from_raw = _champion_name_from_raw(active_player.get("rawChampionName"))
+    if from_raw:
+        return get_champion_id(from_raw)
+    champion_name = active_player.get("championName")
+    if champion_name:
+        return get_champion_id(champion_name)
+    return None
 
 def get_available_teammates(game_data):
     player_name = get_player_name(game_data)
     if not player_name:
         return []
-    player_team = None
-    for player in game_data["allPlayers"]:
-        if _player_name_from_record(player) == player_name:
-            player_team = player.get("team")
-            break
+    player_record = _find_player_record(game_data, player_name)
+    if player_record is None:
+        return []
+    player_team = player_record.get("team")
     if player_team is None:
         return []
+    own_candidates = _name_candidates_from_record(player_record)
     teammate_names = []
     for player in game_data["allPlayers"]:
         name = _player_name_from_record(player)
-        if player.get("team") == player_team and name and name != player_name:
+        if (player.get("team") == player_team
+                and name
+                and not own_candidates.intersection(_name_candidates_from_record(player))):
             teammate_names.append(name)
     return sorted(teammate_names)
 
@@ -438,27 +534,27 @@ def assisted_epic_monster(game_data, player_name, monster_name):
     return False
 
 def player_vision_score(game_data, player_name):
-    for player in game_data["allPlayers"]:
-        if _player_name_from_record(player) == player_name:
-            return player["scores"]["wardScore"]
+    player = _find_player_record(game_data, player_name)
+    if player is not None:
+        return player.get("scores", {}).get("wardScore", 0)
     return 0
 
 def player_creep_score(game_data, player_name):
-    for player in game_data["allPlayers"]:
-        if _player_name_from_record(player) == player_name:
-            return player["scores"]["creepScore"]
+    player = _find_player_record(game_data, player_name)
+    if player is not None:
+        return player.get("scores", {}).get("creepScore", 0)
     return 0
 
 def player_kills(game_data, player_name):
-    for player in game_data["allPlayers"]:
-        if _player_name_from_record(player) == player_name:
-            return player["scores"]["kills"]
+    player = _find_player_record(game_data, player_name)
+    if player is not None:
+        return player.get("scores", {}).get("kills", 0)
     return 0
 
 def player_assists(game_data, player_name):
-    for player in game_data["allPlayers"]:
-        if _player_name_from_record(player) == player_name:
-            return player["scores"]["assists"]
+    player = _find_player_record(game_data, player_name)
+    if player is not None:
+        return player.get("scores", {}).get("assists", 0)
     return 0
 
 def vision_score_above(game_data, player_name, score_target):
@@ -808,6 +904,12 @@ while True:
             window.metadata["game_connected"] = True
             update_teammate_selector(window, get_available_teammates(game_data), game_data)
             get_objectives_complete(game_data, game_values)
+            # Some patches/locales can make end-of-game identity matching flaky.
+            # Ensure own champion's Game Win objective is emitted on a confirmed win.
+            if won_game(game_data):
+                active_champion_id = get_active_player_champion_id(game_data)
+                if active_champion_id is not None and active_champion_id in unlocked_champion_ids:
+                    send_locations([10], active_champion_id)
         else:  # in_game
             if champion_id is not None:
                 window.metadata["selected_champion_id"] = champion_id
