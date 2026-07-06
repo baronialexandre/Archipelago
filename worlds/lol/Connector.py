@@ -5,6 +5,7 @@ import os
 import ast
 import sys
 import unicodedata
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 ###GET VERSION###
@@ -630,29 +631,184 @@ def send_locations(objectives_complete, champion_id):
 ###LCU / CHAMP SELECT###
 
 _lockfile_path_cache = None
+_lockfile_lock = threading.Lock()
+_lockfile_prompting = False  # Flag to prevent concurrent prompts
+_prompt_event = None
+_prompt_result = None
+
+def _get_cached_lockfile_path() -> str:
+    """Load cached lockfile path from config. Returns None if not found or empty (user declined)."""
+    try:
+        cache_file = os.path.join(game_communication_path, "Lockfile_Path.cfg")
+        if os.path.exists(cache_file):
+            with open(cache_file, 'r') as f:
+                path = f.read().strip()
+                if path and os.path.exists(path):
+                    return path
+    except Exception:
+        pass
+    return None
+
+def _save_lockfile_path(path: str) -> None:
+    """Cache the lockfile path or install folder to config."""
+    try:
+        cache_file = os.path.join(game_communication_path, "Lockfile_Path.cfg")
+        with open(cache_file, 'w') as f:
+            f.write(path)
+    except Exception:
+        pass
+
+def _clear_cached_lockfile_path() -> None:
+    """Remove cached lockfile path."""
+    try:
+        cache_file = os.path.join(game_communication_path, "Lockfile_Path.cfg")
+        if os.path.exists(cache_file):
+            os.remove(cache_file)
+    except Exception:
+        pass
+
+
+def _prompt_for_league_path() -> str:
+    """Ask user to select League install folder or executable."""
+    try:
+        # Keep prompting until user selects a folder with a valid lockfile or cancels.
+        while True:
+            result = sg.popup_get_folder(
+                "League Client not found automatically.\n\n"
+                "Please select your League of Legends installation folder\n"
+                "(the folder containing LeagueClientUx.exe)",
+                title="Select League of Legends Folder"
+            )
+            if not result:
+                # user cancelled
+                return None
+            if os.path.exists(result):
+                lockfile_path = os.path.join(result, "lockfile")
+                exe_path = os.path.join(result, "LeagueClientUx.exe")
+                if os.path.exists(lockfile_path):
+                    _save_lockfile_path(lockfile_path)
+                    return lockfile_path
+                # If the folder contains the League executable, accept and cache the folder.
+                if os.path.exists(exe_path):
+                    _save_lockfile_path(result)
+                    sg.popup('Selected folder saved. Lockfile will be detected when the League client runs.', title='Folder Saved')
+                    return result
+                else:
+                    sg.popup('Selected folder does not contain LeagueClientUx.exe. Please select the folder containing LeagueClientUx.exe.', title='Invalid Folder')
+                    continue
+            else:
+                sg.popup('Selected path does not exist. Please choose a valid folder.', title='Invalid Path')
+                continue
+    except Exception:
+        pass
+    return None
 
 def _read_lockfile():
     import subprocess
-    global _lockfile_path_cache
+    global _lockfile_path_cache, _lockfile_lock, _lockfile_prompting, _prompt_event, _prompt_result
+
+    # Fast-path: cached path. Cache may be either a lockfile path (file) or an install folder (dir).
+    if _lockfile_path_cache and _lockfile_path_cache != "":
+        try:
+            # If cached is a file, assume it's the lockfile
+            if os.path.isfile(_lockfile_path_cache):
+                with open(_lockfile_path_cache, 'r') as f:
+                    parts = f.read().strip().split(':')
+                if len(parts) >= 4:
+                    return parts[2].strip(), parts[3].strip()
+                return None, None
+
+            # If cached is a directory, look for 'lockfile' inside it. If not present, poll briefly.
+            if os.path.isdir(_lockfile_path_cache):
+                lockfile_path = os.path.join(_lockfile_path_cache, 'lockfile')
+                if not os.path.exists(lockfile_path):
+                    import time
+                    # wait up to 10s for the client to start and create lockfile
+                    for _ in range(10):
+                        time.sleep(1)
+                        if os.path.exists(lockfile_path):
+                            break
+                if os.path.exists(lockfile_path):
+                    _save_lockfile_path(lockfile_path)
+                    with open(lockfile_path, 'r') as f:
+                        parts = f.read().strip().split(':')
+                    if len(parts) >= 4:
+                        return parts[2].strip(), parts[3].strip()
+                return None, None
+        except Exception:
+            pass
+        return None, None
+
     try:
         if _lockfile_path_cache is None:
-            result = subprocess.run(
-                ["wmic", "process", "where", "name='LeagueClientUx.exe'", "get", "ExecutablePath", "/value"],
-                capture_output=True, text=True, timeout=3,
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-            exe = ""
-            for line in result.stdout.splitlines():
-                if "ExecutablePath=" in line:
-                    exe = line.split("=", 1)[1].strip()
-                    break
-            if not exe:
-                return None, None
-            _lockfile_path_cache = os.path.join(os.path.dirname(exe), "lockfile")
-        with open(_lockfile_path_cache, 'r') as f:
-            parts = f.read().strip().split(':')
-        if len(parts) >= 4:
-            return parts[2].strip(), parts[3].strip()
+            with _lockfile_lock:
+                # Double-check state
+                if _lockfile_path_cache is not None:
+                    pass
+                elif _lockfile_prompting:
+                    return None, None
+                else:
+                    # cached path on disk
+                    cached = _get_cached_lockfile_path()
+                    if cached:
+                        _lockfile_path_cache = cached
+                    else:
+                        # Try WMIC-based detection
+                        try:
+                            result = subprocess.run(
+                                ["wmic", "process", "where", "name='LeagueClientUx.exe'", "get", "ExecutablePath", "/value"],
+                                capture_output=True, text=True, timeout=3,
+                                creationflags=subprocess.CREATE_NO_WINDOW
+                            )
+                            exe = ""
+                            for line in result.stdout.splitlines():
+                                if "ExecutablePath=" in line:
+                                    exe = line.split("=", 1)[1].strip()
+                                    break
+                            if exe:
+                                lockfile_path = os.path.join(os.path.dirname(exe), "lockfile")
+                                if os.path.exists(lockfile_path):
+                                    _lockfile_path_cache = lockfile_path
+                                    _save_lockfile_path(lockfile_path)
+                        except Exception:
+                            pass
+
+                        # If WMIC failed, request the main thread to prompt the user
+                        if _lockfile_path_cache is None:
+                            if 'window' in globals() and window is not None:
+                                _lockfile_prompting = True
+                                res = None
+                                try:
+                                    _prompt_event = threading.Event()
+                                    _prompt_result = None
+                                    window.write_event_value('SHOW_LEAGUE_PROMPT', None)
+                                    # wait up to 30s for user to respond
+                                    if _prompt_event.wait(30):
+                                        res = _prompt_result
+                                    else:
+                                        res = None
+                                finally:
+                                    _lockfile_prompting = False
+                                    _prompt_event = None
+                                    _prompt_result = None
+                                _lockfile_path_cache = res if res else None
+                            else:
+                                # Fallback: blocking popup in background (rare)
+                                _lockfile_prompting = True
+                                try:
+                                    user_result = _prompt_for_league_path()
+                                    _lockfile_path_cache = user_result if user_result else None
+                                finally:
+                                    _lockfile_prompting = False
+                if _lockfile_path_cache is None:
+                    return None, None
+
+        # Parse lockfile contents
+        if _lockfile_path_cache:
+            with open(_lockfile_path_cache, 'r') as f:
+                parts = f.read().strip().split(':')
+            if len(parts) >= 4:
+                return parts[2].strip(), parts[3].strip()
     except Exception:
         _lockfile_path_cache = None
     return None, None
@@ -717,7 +873,7 @@ _THEME_BG = "#2c2825"
 layout = [  [
                 sg.Text('In Match: No', justification = 'center', key = "In Match Text"),
                 sg.Button('Match Tracking: Off', key = "Check for Match Button", button_color=("white", "#5C0000")),
-                sg.Text('', key = "Champ Select Text", text_color="yellow")
+                sg.Text('', key = "Champ Select Text", text_color="yellow"),
             ],
             [   
                 sg.Column(
@@ -763,6 +919,54 @@ while True:
     event, values = window.read(timeout=500)
     if event == sg.WIN_CLOSED:
         break
+    # Main-thread handler for lockfile prompt requests from background threads
+    if event == 'SHOW_LEAGUE_PROMPT':
+        try:
+            # Show folder dialog on main thread
+            result = sg.popup_get_folder(
+                "League Client not found automatically.\n\n"
+                "Please select your League of Legends installation folder\n"
+                "(the folder containing LeagueClientUx.exe)",
+                title="Select League of Legends Folder"
+            )
+            if result and os.path.exists(result):
+                lockfile_path = os.path.join(result, "lockfile")
+                exe_path = os.path.join(result, "LeagueClientUx.exe")
+                if os.path.exists(lockfile_path):
+                    _save_lockfile_path(lockfile_path)
+                    try:
+                        _prompt_result = lockfile_path
+                    except Exception:
+                        pass
+                elif os.path.exists(exe_path):
+                    # Accept and cache install folder even if client not running yet
+                    _save_lockfile_path(result)
+                    try:
+                        _prompt_result = result
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        _prompt_result = None
+                    except Exception:
+                        pass
+            else:
+                try:
+                    _prompt_result = None
+                except Exception:
+                    pass
+        except Exception:
+            try:
+                _prompt_result = None
+            except Exception:
+                pass
+        finally:
+            try:
+                if _prompt_event is not None:
+                    _prompt_event.set()
+            except Exception:
+                pass
+        continue
     if event == 'Check for Match Button':
         in_match = not in_match
         window.metadata["game_connected"] = False
@@ -770,6 +974,7 @@ while True:
             window["Check for Match Button"].update(text="Match Tracking: On", button_color=("white", "#1A5C1A"))
         else:
             window["Check for Match Button"].update(text="Match Tracking: Off", button_color=("white", "#5C0000"))
+    # 'Change Folder' removed -- folder selection is handled via automatic prompt when needed.
     if event == "Hide Completed Checkbox":
         display_champion_list(window)
     if event == "Auto Select Teammates":
