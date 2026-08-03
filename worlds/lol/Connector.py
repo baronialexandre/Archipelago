@@ -28,6 +28,12 @@ champions = {}
 champion_data = requests.get(champions_url).json()["data"]
 
 for champion in list(champion_data.keys()):
+    # Riot added "Jade_X" variants (League of Legends Classic) that share the
+    # same display "name" as the original champion but a different numeric
+    # key (+60000). Skip them so the champion dict has exactly one entry per
+    # champion, matching how Data.py builds it for world generation.
+    if champion.startswith("Jade_"):
+        continue
     champions[int(champion_data[champion]["key"])] = champion_data[champion]
 
 ###SET GLOBAL VARIABLES###

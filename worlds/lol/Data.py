@@ -11,4 +11,9 @@ tags = set([])
 ids = set([])
 
 for champion in list(champion_data.keys()):
+    # Riot added "Jade_X" variants (League of Legends Classic) that share the
+    # same display "name" as the original champion but a different numeric key.
+    # Skip them so name->id lookups don't resolve to the wrong id.
+    if champion.startswith("Jade_"):
+        continue
     champions[int(champion_data[champion]["key"])] = champion_data[champion]
