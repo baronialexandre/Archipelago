@@ -48,6 +48,10 @@ class LOLWorld(World):
     ut_can_gen_without_yaml = True
     web = LOLWeb()
 
+    item_name_groups = {
+        "Champions": {name for name, data in item_table.items() if data.category == "Champion"}
+    }
+
     item_name_to_id = {name: data.code for name, data in item_table.items()}
     location_name_to_id = {name: data.code for name, data in location_table.items()}
     
