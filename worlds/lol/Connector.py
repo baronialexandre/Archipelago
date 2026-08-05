@@ -29,9 +29,8 @@ champion_data = requests.get(champions_url).json()["data"]
 
 for champion in list(champion_data.keys()):
     # Riot added "Jade_X" variants (League of Legends Classic) that share the
-    # same display "name" as the original champion but a different numeric
-    # key (+60000). Skip them so the champion dict has exactly one entry per
-    # champion, matching how Data.py builds it for world generation.
+    # same display name as the original champion but a different numeric key.
+    # Skip them so name->id lookups don't resolve to the wrong id.
     if champion.startswith("Jade_"):
         continue
     champions[int(champion_data[champion]["key"])] = champion_data[champion]
@@ -116,8 +115,31 @@ def get_items(game_values):
                 decoded_item = item_id - 565000000
                 if decoded_item == 0:
                     game_values["current_lp"] = game_values["current_lp"] + 1
-                elif decoded_item in champions:
-                    unlocked_champion_ids.append(decoded_item)
+                else:
+                    # Prefer base champion id when skin-style IDs are present.
+                    champ_id = None
+                    if decoded_item >= 60000 and (decoded_item - 60000) in champions:
+                        champ_id = decoded_item - 60000
+                    elif decoded_item in champions:
+                        champ_id = decoded_item
+                    if champ_id is not None:
+                        unlocked_champion_ids.append(champ_id)
+    # Also treat starting champions as unlocked so they show green even
+    # if no AP_*.item file exists for them.
+    try:
+        start_path = os.path.join(game_communication_path, "Starting_Champions.cfg")
+        if os.path.exists(start_path):
+            with open(start_path, 'r') as f:
+                starting_list = ast.literal_eval(f.read())
+            for name in starting_list:
+                try:
+                    cid = get_champion_id(name)
+                    if cid is not None and cid not in unlocked_champion_ids:
+                        unlocked_champion_ids.append(cid)
+                except Exception:
+                    continue
+    except Exception:
+        pass
 
 def read_cfg(game_values):
     files = os.listdir(game_communication_path)
@@ -255,6 +277,21 @@ def display_champion_list(window):
 
     # Fallback: if mappings aren't available, fall back to previous per-champion send file counting
     champion_table_rows = []
+    # De-duplicate unlocked ids so we don't display duplicate rows when the
+    # same champion appears multiple times in starting lists or AP files.
+    # Also normalize skin-style IDs (>=60000) down to the base champion id.
+    unique_unlocked = []
+    seen_unlocked = set()
+    for cid in unlocked_champion_ids:
+        try:
+            norm = int(cid)
+        except Exception:
+            norm = cid
+        if isinstance(norm, int) and norm >= 60000 and (norm - 60000) in champions:
+            norm = norm - 60000
+        if norm not in seen_unlocked:
+            unique_unlocked.append(norm)
+            seen_unlocked.add(norm)
     if active_locations is None or active_location_ids is None or checked_location_ids is None:
         def count_remaining(champion_id: int) -> int:
             prefix = "send" + str(566000000 + (champion_id * 100))
@@ -268,11 +305,11 @@ def display_champion_list(window):
             total_objectives = 10
             return max(0, total_objectives - cnt)
 
-        for champion_id in unlocked_champion_ids:
+        for champion_id in unique_unlocked:
             remaining = count_remaining(champion_id)
             champion_table_rows.append([champions[champion_id]["name"], str(remaining)])
     else:
-        for champion_id in unlocked_champion_ids:
+        for champion_id in unique_unlocked:
             name = champions[champion_id]["name"]
             total = totals.get(name, 0)
             done_count = done.get(name, 0)
@@ -303,6 +340,24 @@ def display_champion_list(window):
     if window.metadata.get("selected_champion_id") is None and champion_table_rows:
         window.metadata["selected_champion_id"] = get_champion_id(champion_table_rows[0][0])
 
+    # Optional debug log: write internal state for investigation when a
+    # Debug_Champion_List.flag file exists in the LOLAP folder.
+    try:
+        debug_flag = os.path.join(game_communication_path, "Debug_Champion_List.flag")
+        if os.path.exists(debug_flag):
+            debug_path = os.path.join(game_communication_path, "Debug_Champion_List.log")
+            with open(debug_path, 'a', encoding='utf-8') as df:
+                df.write("--- display_champion_list ---\n")
+                df.write("unlocked_champion_ids: %r\n" % (unlocked_champion_ids,))
+                df.write("unique_unlocked: %r\n" % (unique_unlocked,))
+                df.write("totals: %r\n" % (totals,))
+                df.write("done: %r\n" % (done,))
+                df.write("champion_table_rows: %r\n" % (champion_table_rows,))
+                df.write("selected_champion_id: %r\n" % (window.metadata.get("selected_champion_id"),))
+                df.write("-----------------------------\n\n")
+    except Exception:
+        pass
+
     window["Champions Unlocked Table"].update(
         values=champion_table_rows,
         row_colors=[(i, _champion_row_color(get_champion_id(r[0]), window))
@@ -311,6 +366,32 @@ def display_champion_list(window):
     total_champions = sum(1 for k in totals if k != "Starting")
     unlocked_count = len(unlocked_champion_ids)
     window["Champion Count Text"].update(f"({unlocked_count} / {total_champions})")
+
+
+def log_debug_game_data(game_data):
+    if game_data is None:
+        return
+    try:
+        debug_flag = os.path.join(game_communication_path, "Debug_Champion_List.flag")
+        if not os.path.exists(debug_flag):
+            return
+        debug_path = os.path.join(game_communication_path, "Debug_Champion_List.log")
+        with open(debug_path, 'a', encoding='utf-8') as df:
+            df.write("--- debug_game_data ---\n")
+            df.write("activePlayer: %r\n" % (game_data.get("activePlayer"),))
+            df.write("allPlayers: %r\n" % (game_data.get("allPlayers"),))
+            events = game_data.get("events", {}).get("Events", [])
+            df.write("event_count: %d\n" % (len(events),))
+            df.write("objective_events: %r\n" % ([e for e in events if e.get("EventName") in ("TurretKilled", "InhibKilled", "DragonKill", "HeraldKill", "BaronKill")]))
+            df.write("tracked_teammates: %r\n" % (sorted(tracked_teammates),))
+            try:
+                df.write("available_teammates: %r\n" % (get_available_teammates(game_data),))
+            except Exception:
+                df.write("available_teammates: ERROR\n")
+            df.write("-----------------------------\n\n")
+    except Exception:
+        pass
+
 
 def display_values(window, game_values):
     selected_champion_id = window.metadata.get("selected_champion_id") if hasattr(window, "metadata") else None
@@ -394,10 +475,40 @@ def _name_candidates_from_text(name_text):
     text = str(name_text).strip()
     if not text:
         return candidates
-    candidates.add(text.casefold())
+    normalized_text = text.casefold()
+    candidates.add(normalized_text)
+    if normalized_text.startswith("bot "):
+        candidates.add(normalized_text[4:])
+    if normalized_text.startswith("bot_"):
+        candidates.add(normalized_text[4:])
     if "#" in text:
         candidates.add(text.split("#", 1)[0].casefold())
     return candidates
+
+
+def _event_field(event, *keys):
+    for key in keys:
+        if key in event:
+            return event[key]
+        lower = key[0].lower() + key[1:] if key else key
+        if lower in event:
+            return event[lower]
+        upper = key[0].upper() + key[1:] if key else key
+        if upper in event:
+            return event[upper]
+    return None
+
+
+def _event_name_matches(event, *names):
+    raw_name = _event_field(event, "EventName", "eventName", "event_name")
+    if not raw_name:
+        return False
+    normalized = str(raw_name).strip().lower().replace("_", "").replace(" ", "")
+    for name in names:
+        candidate = str(name).strip().lower().replace("_", "").replace(" ", "")
+        if normalized == candidate:
+            return True
+    return False
 
 
 def _find_player_record(game_data, player_name):
@@ -436,10 +547,14 @@ def _normalize_champion_text(text: str) -> str:
 def get_champion_name(game_data, player_name):
     if not player_name:
         return None
-    target_candidates = {str(player_name).casefold()}
-    active_candidates = _name_candidates_from_record(game_data.get("activePlayer", {}))
-    
-    # Fix that teammates use the same champion key as you
+    target_candidates = _name_candidates_from_text(player_name)
+    if not target_candidates:
+        return None
+
+    active_player = game_data.get("activePlayer", {})
+    active_candidates = _name_candidates_from_record(active_player)
+    # Only merge the local player's candidate names when the requested
+    # player_name actually refers to the local player.
     is_self = bool(target_candidates.intersection(active_candidates))
     if is_self:
         target_candidates |= active_candidates
@@ -453,7 +568,6 @@ def get_champion_name(game_data, player_name):
             return player.get("championName")
 
     if is_self:
-        active_player = game_data.get("activePlayer", {})
         from_raw = _champion_name_from_raw(active_player.get("rawChampionName"))
         if from_raw:
             return from_raw
@@ -532,20 +646,84 @@ def get_tracked_players(game_data):
 
 def assisted_tower(game_data, player_name):
     for event in game_data["events"]["Events"]:
-        if event["EventName"] == "TurretKilled" and (event["KillerName"] == player_name or player_name in event["Assisters"]):
+        if _event_name_matches(event, "TurretKilled", "TurretKilledEvent", "TowerKilled") and _event_includes_player(game_data, event, player_name):
             return True
     return False
+
 
 def assisted_inhibitor(game_data, player_name):
     for event in game_data["events"]["Events"]:
-        if event["EventName"] == "InhibKilled" and (event["KillerName"] == player_name or player_name in event["Assisters"]):
+        if _event_name_matches(event, "InhibKilled", "InhibitorKilled", "InhibKilledEvent") and _event_includes_player(game_data, event, player_name):
             return True
     return False
 
+
 def assisted_epic_monster(game_data, player_name, monster_name):
     for event in game_data["events"]["Events"]:
-        if event["EventName"] == monster_name + "Kill" and (event["KillerName"] == player_name or player_name in event["Assisters"]):
+        if _event_name_matches(event, monster_name + "Kill", monster_name + "Killed", monster_name + "KillEvent") and _event_includes_player(game_data, event, player_name):
             return True
+    return False
+
+
+def _event_includes_player(game_data, event, player_name):
+    """Return True if the event involves player_name as killer or assister.
+    Supports multiple Assisters formats: list[str], list[dict], list[int].
+    """
+    try:
+        target_candidates = _name_candidates_from_text(player_name)
+        if not target_candidates:
+            return False
+
+        # Direct killer name match, using normalized candidates.
+        killer_name = _event_field(event, "KillerName", "killerName", "Killer")
+        if killer_name:
+            if killer_name == player_name:
+                return True
+            if _name_candidates_from_text(killer_name) & target_candidates:
+                return True
+
+        # Direct killer ID match if available.
+        player_record = _find_player_record(game_data, player_name)
+        if player_record is not None:
+            killer_id = _event_field(event, "KillerParticipantId", "killerParticipantId", "KillerCellId", "killerCellId", "KillerId", "killerId")
+            if isinstance(killer_id, int):
+                if player_record.get("participantId") == killer_id or player_record.get("cellId") == killer_id:
+                    return True
+
+        assisters = _event_field(event, "Assisters", "assisters", "Assister", "assister", "AssisterName", "assisterName")
+        if assisters is None:
+            assisters = []
+        if isinstance(assisters, str):
+            assisters = [assisters]
+
+        for a in assisters:
+            # If assister is a plain string display name
+            if isinstance(a, str):
+                if a.casefold() in target_candidates or target_candidates & _name_candidates_from_text(a):
+                    return True
+
+            # If assister is a mapping containing a name-like field
+            elif isinstance(a, dict):
+                for key in ("name", "Name", "summonerName", "summonername", "summoner", "displayName", "displayname", "playerName", "playername"):
+                    val = a.get(key)
+                    if val and (_name_candidates_from_text(val) & target_candidates):
+                        return True
+                assister_id = _event_field(a, "participantId", "cellId", "id", "participantID", "cellID")
+                if isinstance(assister_id, int) and player_record is not None:
+                    if player_record.get("participantId") == assister_id or player_record.get("cellId") == assister_id:
+                        return True
+
+            # If assister is an integer ID (participantId or cellId), resolve to player record
+            elif isinstance(a, int):
+                if player_record is not None:
+                    if player_record.get("participantId") == a or player_record.get("cellId") == a:
+                        return True
+                for p in game_data.get("allPlayers", []):
+                    if p.get("participantId") == a or p.get("cellId") == a:
+                        if target_candidates & _name_candidates_from_record(p):
+                            return True
+    except Exception:
+        pass
     return False
 
 def player_vision_score(game_data, player_name):
@@ -1122,6 +1300,7 @@ while True:
             window["In Match Text"].update(status_str)
             window.metadata["game_connected"] = True
             update_teammate_selector(window, get_available_teammates(game_data), game_data)
+            log_debug_game_data(game_data)
             get_objectives_complete(game_data, game_values)
             # Some patches/locales can make end-of-game identity matching flaky.
             # Ensure own champion's Game Win objective is emitted on a confirmed win.
@@ -1138,6 +1317,7 @@ while True:
             window["In Match Text"].update(status_str)
             window.metadata["game_connected"] = True
             update_teammate_selector(window, get_available_teammates(game_data), game_data)
+            log_debug_game_data(game_data)
             get_objectives_complete(game_data, game_values)
 
 window.close()
