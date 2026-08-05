@@ -28,6 +28,12 @@ champions = {}
 champion_data = requests.get(champions_url).json()["data"]
 
 for champion in list(champion_data.keys()):
+    # Riot added "Jade_X" variants (League of Legends Classic) that share the
+    # same display "name" as the original champion but a different numeric
+    # key (+60000). Skip them so the champion dict has exactly one entry per
+    # champion, matching how Data.py builds it for world generation.
+    if champion.startswith("Jade_"):
+        continue
     champions[int(champion_data[champion]["key"])] = champion_data[champion]
 
 ###SET GLOBAL VARIABLES###
@@ -430,21 +436,29 @@ def _normalize_champion_text(text: str) -> str:
 def get_champion_name(game_data, player_name):
     if not player_name:
         return None
+    target_candidates = {str(player_name).casefold()}
     active_candidates = _name_candidates_from_record(game_data.get("activePlayer", {}))
-    if player_name:
-        active_candidates.add(str(player_name).casefold())
+    
+    # Fix that teammates use the same champion key as you
+    is_self = bool(target_candidates.intersection(active_candidates))
+    if is_self:
+        target_candidates |= active_candidates
+
     for player in game_data["allPlayers"]:
         player_candidates = _name_candidates_from_record(player)
-        if active_candidates.intersection(player_candidates):
+        if target_candidates.intersection(player_candidates):
             from_raw = _champion_name_from_raw(player.get("rawChampionName"))
             if from_raw:
                 return from_raw
             return player.get("championName")
-    active_player = game_data.get("activePlayer", {})
-    from_raw = _champion_name_from_raw(active_player.get("rawChampionName"))
-    if from_raw:
-        return from_raw
-    return active_player.get("championName")
+
+    if is_self:
+        active_player = game_data.get("activePlayer", {})
+        from_raw = _champion_name_from_raw(active_player.get("rawChampionName"))
+        if from_raw:
+            return from_raw
+        return active_player.get("championName")
+    return None
 
 def get_champion_id(champion_name):
     if not champion_name:
